@@ -72,20 +72,6 @@ Telegram Trigger
 
 ![Google Sheet row](screenshots/02-google-sheet.png)
 
-| Column | Source |
-|---|---|
-| Logged At | processing time, local timezone |
-| Receipt Date | date printed on the receipt |
-| Merchant | Gemini |
-| Total Amount | Gemini, coerced to a number |
-| Currency | ISO 4217 |
-| Tax | Gemini, coerced to a number |
-| Category | closed vocabulary |
-| Payment Method | closed vocabulary |
-| Submitted By | Telegram sender name |
-| Telegram Message ID | deduplication key |
-| Drive File Link | `webViewLink` from the upload |
-| Extraction Status | `OK` or `NEEDS_REVIEW`, derived |
 
 `Logged At` and `Receipt Date` are deliberately separate. A receipt printed in 2020 can be submitted today, and conflating the two destroys both the business date and the audit trail.
 
