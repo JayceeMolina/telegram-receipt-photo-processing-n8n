@@ -1,0 +1,701 @@
+{
+  "name": "Telegram Receipt Photo Processing",
+  "nodes": [
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.message.photo }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "array",
+                      "operation": "notEmpty",
+                      "singleValue": true
+                    },
+                    "id": "c7c26625-17cd-4f4f-9140-7193d0cdd259"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "photo"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "99da8c07-290a-4fe6-96d5-85d1513d0a68",
+                    "leftValue": "={{ $json.message.document }}",
+                    "rightValue": "image/",
+                    "operator": {
+                      "type": "object",
+                      "operation": "exists",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "document"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        112
+      ],
+      "id": "26cb442a-6808-4c32-95b5-ce09bbc5e819",
+      "name": "Routing"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "fileId": "={{ $json.message.photo[$json.message.photo.length - 1].file_id }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        448,
+        -64
+      ],
+      "id": "504272ae-992d-4968-80be-f15fe6344a03",
+      "name": "Download Photo",
+      "webhookId": "38901103-252f-4d93-83c8-33d148c678c9",
+      "credentials": {
+        "telegramApi": {
+          "id": "gasap7FfRGTCIWX5",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "operation": "analyze",
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-3.5-flash",
+          "mode": "list",
+          "cachedResultName": "models/gemini-3.5-flash"
+        },
+        "text": "You are a receipt data extraction engine. Analyze the receipt image and return ONLY a valid JSON object. No markdown, no code fences, no commentary.\n\nReturn exactly this shape:\n{\n  \"merchant\": string or null,\n  \"receipt_date\": string or null,\n  \"total_amount\": number or null,\n  \"currency\": string or null,\n  \"tax\": number or null,\n  \"category\": string,\n  \"payment_method\": string or null,\n  \"status\": string\n}\n\nRules:\n- If a value is not clearly legible, return null. NEVER guess, infer, or invent a value.\n· - total_amount = the FINAL amount actually charged to the customer, including tax.\n·   Receipts sometimes label a pre-tax subtotal as \"TOTAL\". If a payment/charged/\n·   amount-due line differs from a line labeled \"TOTAL\", use the payment line.\n·   Return it as a positive number even if printed as negative (e.g. -102.98 → 102.98).\n- receipt_date must be ISO format \"YYYY-MM-DD\". If the year is not printed, return null.\n· - Dates like 07/10/2020 are ambiguous. Use the merchant's country, inferred from the\n·   printed address, to decide: US addresses are MM/DD/YYYY, most other countries are\n·   DD/MM/YYYY. If the address gives no country and the day/month are both <= 12,\n·   return null rather than guessing.\n- total_amount and tax: digits only. No currency symbols, no thousand separators, \".\" as decimal point.\n- currency: ISO 4217 code inferred from the symbol (₱=PHP, $=USD, €=EUR, ¥=JPY). If ambiguous, null.\n- category: choose the closest of Food, Groceries, Transport, Utilities, Office Supplies, Health, Entertainment, Other.\n- payment_method: one of Cash, Card, GCash, Bank Transfer, Other.\n- status: \"OK\" only if merchant, receipt_date, and total_amount are ALL non-null. Otherwise \"NEEDS_REVIEW\".\n- If the image is not a receipt at all, return all nulls with status \"NEEDS_REVIEW\".",
+        "inputType": "binary",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        672,
+        -64
+      ],
+      "id": "2ec0bd65-39d1-44d3-b199-c201c36ee0b7",
+      "name": "Extract Receipt Data",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "FLajEZLIu8gS6XER",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * ═══════════════════════════════════════════════════════════════\n *  NODE:  Prepare Data\n *  MODE:  Run Once for All Items\n *  IN:    Extract Receipt Data  (Gemini → raw JSON string)\n *  OUT:   Clean typed fields + image binary, ready for Drive & Sheets\n * ═══════════════════════════════════════════════════════════════\n *  Responsibilities:\n *    1. Parse Gemini's JSON string into real fields\n *    2. NORMALISE + VALIDATE every field (never trust an LLM's types)\n *    3. Convert Telegram's UTC timestamp to a local calendar date\n *    4. Generate a filesystem-safe, descriptive filename\n *    5. Recompute `status` from the CLEANED values, not Gemini's claim\n *    6. Carry the image binary forward (Gemini strips it)\n * ═══════════════════════════════════════════════════════════════\n */\n\n// ══ CONFIG ═════════════════════════════════════════════════════\n\n// Timezone for BOTH the Drive folder name and the \"Logged At\" column.\n// Telegram sends UTC. Manila is UTC+8, so a receipt submitted at 07:00\n// local is 23:00 the PREVIOUS DAY in UTC. Without this, every receipt\n// sent before 08:00 lands in yesterday's folder.\nconst TZ = 'Asia/Manila';\n\n// Closed vocabularies. A closed enum keeps the Sheet columns groupable —\n// open-ended AI output yields \"Food\", \"food\", \"Dining\", \"Restaurant\" for\n// the same concept and fragments every pivot table.\nconst CATEGORIES = ['Food', 'Groceries', 'Transport', 'Utilities',\n                    'Office Supplies', 'Health', 'Entertainment', 'Other'];\nconst PAYMENTS   = ['Cash', 'Card', 'GCash', 'Bank Transfer', 'Other'];\n\n// ══ NORMALISERS ════════════════════════════════════════════════\n// Gemini follows the prompt ~99% of the time. These functions handle\n// the other 1% so a stray response can never poison the spreadsheet.\n\n/** Trim to a clean string, or null. Empty/whitespace-only → null. */\nconst text = (v) => {\n  const s = String(v ?? '').trim();\n  return s === '' || s.toLowerCase() === 'null' ? null : s;\n};\n\n/**\n * FIX #1 — Force numeric.\n * The prompt says \"digits only\", but if Gemini ever returns \"₱1,250.00\"\n * or the string \"102.98\", the Sheet's Number-formatted column receives\n * text and every SUM() silently breaks. We strip non-numeric characters\n * and coerce. Non-numeric garbage becomes null, never NaN — NaN written\n * to Sheets appears as a literal \"NaN\" cell.\n */\nconst num = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(String(v).replace(/[^0-9.\\-]/g, ''));\n  return Number.isFinite(n) ? n : null;\n};\n\n/**\n * FIX #2 — Enforce ISO date shape.\n * If Gemini returns \"10/07/2020\" we CANNOT know if that's 10 July or\n * 7 October. An ambiguous date is worse than no date, because it looks\n * valid. Anything not matching YYYY-MM-DD is rejected outright.\n */\nconst isoDate = (v) => {\n  const s = text(v);\n  return s && /^\\d{4}-\\d{2}-\\d{2}$/.test(s) ? s : null;\n};\n\n/** Currency must be a 3-letter ISO 4217 code, else null. */\nconst currency = (v) => {\n  const s = (text(v) ?? '').toUpperCase();\n  return /^[A-Z]{3}$/.test(s) ? s : null;\n};\n\n/**\n * FIX #3 — Snap to the closed vocabulary.\n * Case-insensitive match against the allowed list; anything invented\n * (e.g. \"Fuel\", \"Gas Station\") collapses to \"Other\" rather than\n * creating a new category nobody expected.\n */\nconst oneOf = (v, list, fallback) => {\n  const s = text(v);\n  if (!s) return fallback;\n  return list.find((x) => x.toLowerCase() === s.toLowerCase()) ?? fallback;\n};\n\n/**\n * Make an AI-generated string safe inside a filename.\n *\n * SECURITY: merchant names come from an LLM reading an untrusted image.\n * Characters like / \\ .. : are illegal or dangerous in paths\n * (path traversal). We allow ONLY [a-zA-Z0-9] and collapse the rest.\n *\n *   \"FUEL DEPOT #12/A\"  →  \"FUEL-DEPOT-12-A\"\n */\nconst slug = (s) => (s || 'Unknown')\n  .replace(/[^a-zA-Z0-9]+/g, '-')   // any run of non-alphanumerics → one \"-\"\n  .replace(/^-+|-+$/g, '')          // trim leading/trailing hyphens\n  .slice(0, 40) || 'Unknown';       // cap length; catch input like \"***\"\n\n// ══ DATE FORMATTERS ════════════════════════════════════════════\n\n/**\n * \"YYYY-MM-DD\" in the configured timezone.\n * 'en-CA' is a deliberate trick — it natively produces ISO order.\n * '2-digit' guarantees zero-padding (08, not 8) so folders sort right.\n */\nconst fmtDate = (d) => new Intl.DateTimeFormat('en-CA', {\n  timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',\n}).format(d);\n\n/**\n * \"HH:mm:ss\" 24-hour in the configured timezone.\n * hour12:false avoids AM/PM, which breaks lexical sorting.\n */\nconst fmtTime = (d) => new Intl.DateTimeFormat('en-GB', {\n  timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,\n}).format(d);\n\n// ══ MAIN ═══════════════════════════════════════════════════════\n\n// Cache the array — $input.all() is a function call, not a property.\nconst items   = $input.all();\nconst results = [];\n\n// Loop by index to align this item with the SAME item from earlier\n// nodes. Index alignment is valid because every node in this branch\n// is strictly 1-in / 1-out.\nfor (let i = 0; i < items.length; i++) {\n\n  // ── 1. Pull Gemini's raw response ──────────────────────────\n  // Path confirmed from live output: content.parts[0].text\n  // Optional chaining prevents a hard crash if the node's output\n  // shape changes after an update — we degrade to '' instead.\n  // We read ONLY .text and deliberately ignore .thoughtSignature,\n  // a multi-KB reasoning blob that would bloat every execution log.\n  const raw    = items[i].json?.content?.parts?.[0]?.text ?? '';\n\n  // 'STOP' = finished normally. 'MAX_TOKENS' = cut off mid-JSON.\n  const finish = items[i].json?.finishReason ?? 'UNKNOWN';\n\n  // ── 2. Strip fences, then parse ────────────────────────────\n  // The prompt forbids markdown fences and Gemini complies, but LLMs\n  // are probabilistic — occasionally one wraps JSON in ```json ... ```.\n  // Stripping is cheap; a JSON.parse crash costs a lost receipt.\n  const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();\n\n  let parsed     = {};\n  let parseOk    = true;\n  try {\n    parsed = JSON.parse(cleaned);\n  } catch (err) {\n    // GRACEFUL DEGRADATION: unparseable output produces a flagged row,\n    // not a dead execution. The receipt shows up as NEEDS_REVIEW\n    // instead of vanishing silently.\n    parseOk = false;\n  }\n\n  // ── 3. Normalise every field ───────────────────────────────\n  // Nothing from the model reaches the Sheet unvalidated.\n  const merchant      = text(parsed.merchant);\n  const receiptDate   = isoDate(parsed.receipt_date);\n  const totalAmount   = num(parsed.total_amount);\n  const tax           = num(parsed.tax);\n  const currencyCode  = currency(parsed.currency);\n  const category      = oneOf(parsed.category,       CATEGORIES, 'Other');\n  const paymentMethod = oneOf(parsed.payment_method, PAYMENTS,   null);\n\n  // ── 4. FIX #4 — Recompute status from CLEANED values ───────\n  // We do NOT trust Gemini's own \"status\" field. It might report \"OK\"\n  // while returning a malformed date that our validator just nulled.\n  // Deriving status here guarantees it always reflects what actually\n  // landed in the Sheet — a single source of truth for the Telegram\n  // reply and for any human reviewing the log.\n  let status = (merchant && receiptDate && totalAmount !== null)\n    ? 'OK'\n    : 'NEEDS_REVIEW';\n\n  // Truncated or unparseable responses are untrustworthy regardless\n  // of whether the individual fields happen to look fine.\n  if (!parseOk || finish !== 'STOP') status = 'NEEDS_REVIEW';\n\n  // ── 5. Derive dates from the Telegram message ──────────────\n  // Referenced by NODE NAME — renaming 'Telegram Trigger' breaks this.\n  const msg = $('Telegram Trigger').all()[i].json.message;\n\n  // msg.date is Unix SECONDS; JavaScript Date wants MILLISECONDS.\n  // Omitting * 1000 yields January 1970.\n  const submittedAt = new Date(msg.date * 1000);\n\n  // THIS is the \"group by submission date\" requirement. Deliberately\n  // the submission date, NOT the receipt's printed date — which can be\n  // years old (ours reads 2020-07-10).\n  const folderName = fmtDate(submittedAt);\n\n  // Audit trail: when OUR system processed it, to the second.\n  const loggedAt   = `${folderName} ${fmtTime(submittedAt)}`;\n\n  // ── 6. FIX #5 — Build the filename defensively ─────────────\n  // Telegram's photo path re-encodes images and discards metadata, so\n  // every upload arrives named \"file_0.jpg\". Uploading that verbatim\n  // gives a Drive folder of identical filenames.\n\n  // Array.isArray guard: when we later wire the `document` branch into\n  // this node, msg.photo will be undefined. Without this the node\n  // throws instead of degrading. Forward-compatible by design.\n  const photos       = Array.isArray(msg.photo) ? msg.photo : [];\n\n  // Last element = highest resolution (Telegram orders small → large).\n  const largest      = photos.length ? photos[photos.length - 1] : null;\n\n  // Works for both branches; null if neither is present.\n  const fileUniqueId = largest?.file_unique_id\n                    ?? msg.document?.file_unique_id\n                    ?? null;\n\n  // Preserve a real extension when one exists (document branch),\n  // otherwise default to jpg (photo branch is always JPEG).\n  const ext = (msg.document?.file_name?.split('.').pop() ?? 'jpg')\n                .toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';\n\n  // THE DOT FIX: \"102.98\" would make Drive report fullFileExtension as\n  // \"98_msg5.jpg\", because Drive treats everything after the FIRST dot\n  // as the extension. Swapping \".\" for \"-\" keeps exactly one dot in the\n  // filename — the real one before the extension.\n  //   102.98  →  102-98\n  const amountTag = totalAmount === null\n    ? 'NA'\n    : String(totalAmount).replace('.', '-');\n\n  // message_id is unique per chat, guaranteeing no overwrite even if\n  // two identical receipts arrive the same day.\n  //   → 2026-08-31_FUEL-DEPOT_102-98_msg5.jpg\n  const fileName = `${folderName}_${slug(merchant)}_${amountTag}_msg${msg.message_id}.${ext}`;\n\n  // ── 7. Emit the item ───────────────────────────────────────\n  results.push({\n    json: {\n      // — Bookkeeping / audit —\n      loggedAt,       // when we processed it (local time)\n      folderName,     // Drive folder target  (YYYY-MM-DD)\n      fileName,       // generated Drive filename\n\n      // — Validated receipt data —\n      merchant,       // trimmed string or null\n      receiptDate,    // strict YYYY-MM-DD or null — date PRINTED on receipt\n      totalAmount,    // NUMBER or null — must stay summable in Sheets\n      currency:       currencyCode,   // separate column so amount stays numeric\n      tax,            // NUMBER or null\n      category,       // guaranteed one of CATEGORIES\n      paymentMethod,  // one of PAYMENTS, or null\n      status,         // OK | NEEDS_REVIEW → drives the Telegram reply\n\n      // — Telegram context —\n      // .trim() handles users with no last name.\n      submittedBy:  `${msg.from?.first_name ?? ''} ${msg.from?.last_name ?? ''}`.trim() || 'Unknown',\n\n      chatId:       msg.chat.id,      // needed to reply at the end of the flow\n      messageId:    msg.message_id,   // dedup key: catches retries of one message\n      fileUniqueId,                   // dedup key: catches the SAME IMAGE resent\n    },\n\n    // ⚠️ CRITICAL — do not delete this line.\n    // The Gemini node returns text only; the image binary is NOT on\n    // items[i], and Code nodes don't auto-forward binary. We pull it\n    // back from 'Download Photo', or 'Upload to Drive' fails with\n    // \"no binary data\" — the #1 gotcha in this workflow.\n    binary: $('Download Photo').all()[i].binary,\n  });\n}\n\n// n8n Code-node output contract: an array of { json, binary } objects.\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -64
+      ],
+      "id": "e6fe492a-5b37-41c5-8e57-55acf03a2fa8",
+      "name": "Prepare Data"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.5,
+      "position": [
+        0,
+        128
+      ],
+      "id": "30c82e01-85ca-4da1-b4f4-3f09d671bd6e",
+      "name": "Telegram Trigger",
+      "webhookId": "c4a44751-8933-4af9-98e5-22ed3885cce3",
+      "credentials": {
+        "telegramApi": {
+          "id": "gasap7FfRGTCIWX5",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "fileFolder",
+        "searchMethod": "query",
+        "queryString": "={{ `name = '${$json.folderName}' and mimeType = 'application/vnd.google-apps.folder' and '1ldU2IjFFa12Ek17JNzit1F52LG7SGjVN' in parents and trashed = false` }}",
+        "limit": 1,
+        "filter": {},
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1120,
+        -64
+      ],
+      "id": "07f17565-3bec-4b35-90da-d33eaec0f12d",
+      "name": "Find Date Folder",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "jeMIW3I8d9Prdotx",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a84c3f18-7db7-42d6-aa60-17f42d875f19",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1344,
+        -64
+      ],
+      "id": "b62a2d17-e320-4f41-b773-b9ec98ea6ba6",
+      "name": "Folder Exists?"
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{ $('Prepare Data').first().json.folderName }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "1ldU2IjFFa12Ek17JNzit1F52LG7SGjVN",
+          "mode": "list",
+          "cachedResultName": "Telegram Receipt Photo Processing",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1ldU2IjFFa12Ek17JNzit1F52LG7SGjVN"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1568,
+        16
+      ],
+      "id": "5c1e17a9-dd94-4e0f-b20a-62d1b9dea943",
+      "name": "Create Date Folder",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "jeMIW3I8d9Prdotx",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * ═══════════════════════════════════════════════════════════\n *  NODE: Attach Image\n *  IN:   Folder Exists? (true)  OR  Create Date Folder\n *  OUT:  All receipt fields + folderId + image binary\n * ═══════════════════════════════════════════════════════════\n *  This is the CONVERGENCE point. Everything the remaining\n *  nodes need is assembled here, in one shape.\n * ═══════════════════════════════════════════════════════════\n */\n\n// The original item: receipt fields in .json, photo in .binary.\n// Safe to use .first() because Telegram fires one execution per message.\nconst src = $('Prepare Data').first();\n\n// Whichever branch delivered the item, it has an .id holding the\n// folder ID — Drive's search result and Drive's create response use\n// the SAME field name. That's why no branch detection is needed.\nconst folderId = $input.first().json.id;\n\nreturn [{\n  json: {\n    ...src.json,   // loggedAt, fileName, merchant, totalAmount, ...\n    folderId,      // ← the one new field: where to upload\n  },\n\n  // ⚠️ Re-attach the photo. Neither the Drive search nor the Drive\n  // create response carries binary, so the image was dropped two\n  // nodes ago. Without this, Upload to Drive fails: \"no binary data\".\n  binary: src.binary,\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        -64
+      ],
+      "id": "e585f753-964e-424b-8a0b-0a36f93dc370",
+      "name": "Attach Image"
+    },
+    {
+      "parameters": {
+        "name": "={{ $json.fileName }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "={{ $json.folderId }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2016,
+        -64
+      ],
+      "id": "3f61b104-e252-4cea-b971-9d721dbe519f",
+      "name": "Upload to Drive",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "jeMIW3I8d9Prdotx",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "16kXy7dSkbxJ2PD6hhGgsYSuczKyqWu3vJRPtW7tcbEg",
+          "mode": "list",
+          "cachedResultName": "Receipt Log - Precision Data",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/16kXy7dSkbxJ2PD6hhGgsYSuczKyqWu3vJRPtW7tcbEg/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Receipts",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/16kXy7dSkbxJ2PD6hhGgsYSuczKyqWu3vJRPtW7tcbEg/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Logged At": "={{ $('Attach Image').first().json.loggedAt }}",
+            "Receipt Date": "={{ $('Attach Image').first().json.receiptDate }}",
+            "Merchant": "={{ $('Attach Image').first().json.merchant }}",
+            "Total Amount": "={{ $('Attach Image').first().json.totalAmount }}",
+            "Currency": "={{ $('Attach Image').first().json.currency }}",
+            "Tax": "={{ $('Attach Image').first().json.tax }}",
+            "Category": "={{ $('Attach Image').first().json.category }}",
+            "Payment Method": "={{ $('Attach Image').first().json.paymentMethod }}",
+            "Submitted By": "={{ $('Attach Image').first().json.submittedBy }}",
+            "Telegram Message ID": "={{ $('Attach Image').first().json.messageId }}",
+            "Drive File Link": "={{ $json.webViewLink }}",
+            "Extraction Status": "={{ $('Attach Image').first().json.status }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Logged At",
+              "displayName": "Logged At",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Receipt Date",
+              "displayName": "Receipt Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Merchant",
+              "displayName": "Merchant",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Total Amount",
+              "displayName": "Total Amount",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Currency",
+              "displayName": "Currency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Tax",
+              "displayName": "Tax",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Payment Method",
+              "displayName": "Payment Method",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Submitted By",
+              "displayName": "Submitted By",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Telegram Message ID",
+              "displayName": "Telegram Message ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Drive File Link",
+              "displayName": "Drive File Link",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Extraction Status",
+              "displayName": "Extraction Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2240,
+        -64
+      ],
+      "id": "51632052-722f-41f1-9741-1e6f003b5b14",
+      "name": "Log to Sheet",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vkLmtOYEWnCIiSBW",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Attach Image').first().json.chatId }}",
+        "text": "={{ [$('Attach Image').first().json.status === 'OK' ? '✓ Receipt logged successfully' : '⚠️ Receipt saved, but needs review', '', '🏪 ' + ($('Attach Image').first().json.merchant ?? 'Merchant unreadable'), '📅 ' + ($('Attach Image').first().json.receiptDate ?? 'Date unreadable'), '💰 ' + ($('Attach Image').first().json.totalAmount ?? '?') + ' ' + ($('Attach Image').first().json.currency ?? ''), '🧾 Tax: ' + ($('Attach Image').first().json.tax ?? 0), '🏷️ ' + $('Attach Image').first().json.category, '💳 ' + ($('Attach Image').first().json.paymentMethod ?? 'Unknown'), '', '📁 Filed under ' + $('Attach Image').first().json.folderName, '🔗 ' + $('Upload to Drive').first().json.webViewLink].join('\\n') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "reply_to_message_id": "={{ $('Attach Image').first().json.messageId }}"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2464,
+        -64
+      ],
+      "id": "d425ca78-c953-4134-bd93-b10a86758c16",
+      "name": "Notify Success",
+      "webhookId": "dece9b56-51eb-4703-814f-757f2692ecc4",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gasap7FfRGTCIWX5",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.message.chat.id }}",
+        "text": "={{ ($json.message.text || '').trim() === '/start' ? ['👋 Hi ' + ($json.message.from.first_name ?? 'there') + '!', '', 'I turn receipt photos into a spreadsheet automatically.', '', '📸 Send me a photo of any receipt and I will:', '• read the merchant, date, and amount', '• log it to your Google Sheet', '• save the photo in Drive, grouped by date', '', 'Go ahead, send your first receipt.'].join('\\n') : ['📸 Please send a photo of a receipt.', '', 'I can only read photos. Files, PDFs, text messages, stickers, and voice notes will not work.', '', 'Tap the 📎 attach button, choose Gallery, and pick your receipt image.'].join('\\n') }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        448,
+        320
+      ],
+      "id": "2f5b4144-cf98-4a62-9e0d-e6fad24a9af5",
+      "name": "Notify Invalid Input",
+      "webhookId": "90862b6b-5a19-4ba5-a472-f7fe437f702e",
+      "credentials": {
+        "telegramApi": {
+          "id": "gasap7FfRGTCIWX5",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.message.chat.id }}",
+        "text": "={{ ['📄 Sorry, I cannot accept files.', '', 'You sent: ' + ($json.message.document.file_name ?? 'a file') + '  (' + ($json.message.document.mime_type ?? 'unknown type') + ')', '', '📸 Please send your receipt as a photo instead.', '', 'Tap the 📎 attach button, choose Gallery, and pick the receipt image.'].join('\\n') }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        448,
+        128
+      ],
+      "id": "5fe70db4-9532-4d28-8638-e89601eece6a",
+      "name": "Notify Unsupported File",
+      "webhookId": "4f39deb8-d684-419b-bafe-4c0c4215fd2c",
+      "credentials": {
+        "telegramApi": {
+          "id": "gasap7FfRGTCIWX5",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Routing": {
+      "main": [
+        [
+          {
+            "node": "Download Photo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Unsupported File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Invalid Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Photo": {
+      "main": [
+        [
+          {
+            "node": "Extract Receipt Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Receipt Data": {
+      "main": [
+        [
+          {
+            "node": "Prepare Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Routing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Data": {
+      "main": [
+        [
+          {
+            "node": "Find Date Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Date Folder": {
+      "main": [
+        [
+          {
+            "node": "Folder Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Folder Exists?": {
+      "main": [
+        [
+          {
+            "node": "Attach Image",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Date Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Date Folder": {
+      "main": [
+        [
+          {
+            "node": "Attach Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Image": {
+      "main": [
+        [
+          {
+            "node": "Upload to Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload to Drive": {
+      "main": [
+        [
+          {
+            "node": "Log to Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Sheet": {
+      "main": [
+        [
+          {
+            "node": "Notify Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "563758e3-42ba-4d5c-ab1c-dd2c4aa4f108",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "101adc598c25125fe7715c8fa7ba3a56b3006e35825585716c6b527dbff4ce57"
+  },
+  "nodeGroups": [],
+  "id": "CxyYJJBXhxQzqwWi",
+  "tags": []
+}
