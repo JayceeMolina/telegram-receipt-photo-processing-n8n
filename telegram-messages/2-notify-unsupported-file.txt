@@ -1,0 +1,1 @@
+{{ ['📄 Sorry, I cannot accept files.', '', 'You sent: ' + ($json.message.document.file_name ?? 'a file') + '  (' + ($json.message.document.mime_type ?? 'unknown type') + ')', '', '📸 Please send your receipt as a photo instead.', '', 'Tap the 📎 attach button, choose Gallery, and pick the receipt image.'].join('\n') }}
