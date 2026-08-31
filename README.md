@@ -208,6 +208,5 @@ On n8n Cloud the Google credentials use Managed OAuth2 — click *Sign in with G
 ```
 workflow/            n8n workflow export
 prompts/             the Gemini extraction prompt, as plain text
-telegram-messages/   the three Telegram reply templates
 screenshots/         evidence of the workflow running
 ```
