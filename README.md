@@ -2,8 +2,6 @@
 
 An n8n workflow that turns receipt photos sent to a Telegram bot into structured spreadsheet rows and a dated Google Drive archive, using Google Gemini for extraction.
 
-Built for the Precision Data Solutions AI Developer assessment (Workflow 2).
-
 **Stack:** n8n Cloud · Telegram Bot API · Google Gemini `gemini-3.5-flash` · Google Sheets · Google Drive
 
 ---
